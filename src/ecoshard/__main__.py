@@ -6,6 +6,7 @@ import hashlib
 import logging
 import multiprocessing
 import os
+import queue
 import sys
 import threading
 
@@ -205,23 +206,22 @@ def main():
             args.datetime, args.asset_id, args.catalog_list)
         return 0
 
-    if args.file_path:
-        worker_thread_list = []
-        work_queue = queue.Queue(args.n_workers)
-        for _ in range(args.n_workers):
-            worker_thread = threading.Thread(
-                target=file_processor,
-                args=(work_queue,))
-            worker_thread.start()
-            worker_thread_list.append(worker_thread)
+    worker_thread_list = []
+    work_queue = queue.Queue(args.n_workers)
+    for _ in range(args.n_workers):
+        worker_thread = threading.Thread(
+            target=file_processor,
+            args=(work_queue,))
+        worker_thread.start()
+        worker_thread_list.append(worker_thread)
 
-        if args.reduce_factor:
-            method = args.reduce_factor[1]
-            valid_methods = ["max", "min", "sum", "average", "mode"]
-            if method not in valid_methods:
-                LOGGER.error(
-                    '--reduce_method must be one of %s' % valid_methods)
-                sys.exit(-1)
+    if args.reduce_factor:
+        method = args.reduce_factor[1]
+        valid_methods = ["max", "min", "sum", "average", "mode"]
+        if method not in valid_methods:
+            LOGGER.error(
+                '--reduce_method must be one of %s' % valid_methods)
+            sys.exit(-1)
 
     for glob_pattern in args.filepath:
         for file_path in glob.glob(glob_pattern):
