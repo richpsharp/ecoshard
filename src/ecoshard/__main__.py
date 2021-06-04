@@ -4,6 +4,7 @@ import configparser
 import glob
 import hashlib
 import logging
+import multiprocessing
 import os
 import sys
 import threading
@@ -23,10 +24,11 @@ LOGGER = logging.getLogger(__name__)
 
 CONFIG_PATH = os.path.expanduser(os.path.join('~', 'ecoshard.ini'))
 
+RETURN_CODE = 0
+
 
 def main():
     """Execute main and return valid return code "0 if fine"."""
-    return_code = 0
     parser = argparse.ArgumentParser(description='Ecoshard files.')
     subparsers = parser.add_subparsers(dest='command')
 
@@ -88,7 +90,6 @@ def main():
     publish_subparser.add_argument(
         '--force', action='store_true', help=(
             'force a raster to be republished.'))
-
     process_subparser = subparsers.add_parser(
         'process', help='process files/ecoshards')
     process_subparser.add_argument(
@@ -102,6 +103,9 @@ def main():
         help='Choose one of: "%s"' % '|'.join(hashlib.algorithms_available))
     process_subparser.add_argument(
         '--compress', action='store_true', help='Compress the raster files.')
+    process_subparser.add_argument(
+        '--compression_algorithm',
+        help='Compression algorithm to use.', default='LZW')
     process_subparser.add_argument(
         '--buildoverviews', action='store_true',
         help='Build overviews on the raster files.')
@@ -130,6 +134,8 @@ def main():
             "Reduce size by [factor] to with [method] to [target]. "
             "[method] must be one of 'max', 'min', 'sum', 'average', 'mode'"),
         nargs=3)
+    process_subparser.add_argument(
+        '--n_workers', type=int, default=multiprocessing.cpu_count())
 
     args = parser.parse_args()
 
@@ -199,59 +205,92 @@ def main():
             args.datetime, args.asset_id, args.catalog_list)
         return 0
 
+    if args.file_path:
+        worker_thread_list = []
+        work_queue = queue.Queue(args.n_workers)
+        for _ in range(args.n_workers):
+            worker_thread = threading.Thread(
+                target=file_processor,
+                args=(work_queue,))
+            worker_thread.start()
+            worker_thread_list.append(worker_thread)
+
+        if args.reduce_factor:
+            method = args.reduce_factor[1]
+            valid_methods = ["max", "min", "sum", "average", "mode"]
+            if method not in valid_methods:
+                LOGGER.error(
+                    '--reduce_method must be one of %s' % valid_methods)
+                sys.exit(-1)
+
     for glob_pattern in args.filepath:
         for file_path in glob.glob(glob_pattern):
-            working_file_path = file_path
-            LOGGER.info('processing %s', file_path)
+            work_queue.put(file_path)
 
-            if args.reduce_factor:
-                method = args.reduce_factor[1]
-                valid_methods = ["max", "min", "sum", "average", "mode"]
-                if method not in valid_methods:
+    work_queue.put(None)
+    for worker_thread in worker_thread_list:
+        worker_thread.join()
+
+    return RETURN_CODE
+
+
+def file_processor(work_queue):
+    """Process a given file with path and args."""
+    global RETURN_CODE
+    while True:
+        payload = work_queue.get()
+        if payload is None:
+            work_queue.put(None)
+        file_path, args = payload
+        LOGGER.info(f'processing %s', file_path)
+
+        if args.reduce_factor:
+            method = args.reduce_factor[1]
+            valid_methods = ["max", "min", "sum", "average", "mode"]
+            if method not in valid_methods:
+                LOGGER.error(
+                    '--reduce_method must be one of %s' % valid_methods)
+                sys.exit(-1)
+            ecoshard.convolve_layer(
+                file_path, int(args.reduce_factor[0]),
+                args.reduce_factor[1],
+                args.reduce_factor[2])
+            continue
+
+        if args.compress:
+            prefix, suffix = os.path.splitext(file_path)
+            compressed_filename = '%s_compressed%s' % (prefix, suffix)
+            ecoshard.compress_raster(
+                file_path, compressed_filename,
+                compression_algorithm=args.compression_algorithm)
+            working_file_path = compressed_filename
+
+        if args.buildoverviews:
+            overview_token_path = '%s.OVERVIEWCOMPLETE' % (
+                working_file_path)
+            ecoshard.build_overviews(
+                working_file_path, target_token_path=overview_token_path,
+                interpolation_method=args.interpolation_method)
+
+        if args.validate:
+            try:
+                is_valid = ecoshard.validate(working_file_path)
+                if is_valid:
+                    LOGGER.info('VALID ECOSHARD: %s', working_file_path)
+                else:
                     LOGGER.error(
-                        '--reduce_method must be one of %s' % valid_methods)
-                    sys.exit(-1)
-                ecoshard.convolve_layer(
-                    file_path, int(args.reduce_factor[0]),
-                    args.reduce_factor[1],
-                    args.reduce_factor[2])
-                continue
-
-            if args.compress:
-                prefix, suffix = os.path.splitext(file_path)
-                compressed_filename = '%s_compressed%s' % (prefix, suffix)
-                ecoshard.compress_raster(
-                    file_path, compressed_filename,
-                    compression_algorithm='DEFLATE')
-                working_file_path = compressed_filename
-
-            if args.buildoverviews:
-                overview_token_path = '%s.OVERVIEWCOMPLETE' % (
-                    working_file_path)
-                ecoshard.build_overviews(
-                    working_file_path, target_token_path=overview_token_path,
-                    interpolation_method=args.interpolation_method)
-
-            if args.validate:
-                try:
-                    is_valid = ecoshard.validate(working_file_path)
-                    if is_valid:
-                        LOGGER.info('VALID ECOSHARD: %s', working_file_path)
-                    else:
-                        LOGGER.error(
-                            'got a False, but no ValueError on validate? '
-                            'that is not impobipible?')
-                except ValueError:
-                    LOGGER.error('INVALID ECOSHARD: %s', working_file_path)
-                    return_code = -1
-            elif args.hash_file:
-                hash_token_path = '%s.ECOSHARDCOMPLETE' % (
-                    working_file_path)
-                ecoshard.hash_file(
-                    working_file_path, target_token_path=hash_token_path,
-                    rename=args.rename, hash_algorithm=args.hashalg,
-                    force=args.force)
-    return return_code
+                        'got a False, but no ValueError on validate? '
+                        'that is not impobipible?')
+            except ValueError:
+                LOGGER.error('INVALID ECOSHARD: %s', working_file_path)
+                RETURN_CODE = -1
+        elif args.hash_file:
+            hash_token_path = '%s.ECOSHARDCOMPLETE' % (
+                working_file_path)
+            ecoshard.hash_file(
+                working_file_path, target_token_path=hash_token_path,
+                rename=args.rename, hash_algorithm=args.hashalg,
+                force=args.force)
 
 
 if __name__ == '__main__':
