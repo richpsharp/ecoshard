@@ -211,7 +211,7 @@ def main():
     for _ in range(args.n_workers):
         worker_thread = threading.Thread(
             target=file_processor,
-            args=(work_queue,))
+            args=(args, work_queue,))
         worker_thread.start()
         worker_thread_list.append(worker_thread)
 
@@ -234,15 +234,15 @@ def main():
     return RETURN_CODE
 
 
-def file_processor(work_queue):
+def file_processor(args, work_queue):
     """Process a given file with path and args."""
     global RETURN_CODE
     while True:
         payload = work_queue.get()
         if payload is None:
             work_queue.put(None)
-        file_path, args = payload
-        LOGGER.info(f'processing %s', file_path)
+        file_path = payload
+        LOGGER.info(f'processing {file_path}')
 
         if args.reduce_factor:
             method = args.reduce_factor[1]
