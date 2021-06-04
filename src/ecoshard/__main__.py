@@ -241,6 +241,7 @@ def file_processor(args, work_queue):
         payload = work_queue.get()
         if payload is None:
             work_queue.put(None)
+            break
         file_path = payload
         LOGGER.info(f'processing {file_path}')
 
