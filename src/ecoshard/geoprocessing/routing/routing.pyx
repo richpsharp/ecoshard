@@ -2407,6 +2407,288 @@ def flow_accumulation_mfd(
     LOGGER.info('%.1f%% complete', 100.0)
 
 
+def flow_accumulation_mfd_saga(
+        flow_dir_mfd_raster_path_band, dem_raster_path_band,
+        target_flow_accum_raster_path,
+        weight_raster_path_band=None,
+        raster_driver_creation_tuple=DEFAULT_GTIFF_CREATION_TUPLE_OPTIONS):
+    """Multiple flow direction accumulation.
+
+    Parameters:
+        flow_dir_mfd_raster_path_band (tuple): a path, band number tuple
+            for a multiple flow direction raster generated from a call to
+            ``flow_dir_mfd``. The format of this raster is described in the
+            docstring of that function.
+        target_flow_accum_raster_path (str): a path to a raster created by
+            a call to this function that is the same dimensions and projection
+            as ``flow_dir_mfd_raster_path_band[0]``. The value in each pixel is
+            1 plus the proportional contribution of all upstream pixels that
+            flow into it. The proportion is determined as the value of the
+            upstream flow dir pixel in the downslope direction pointing to
+            the current pixel divided by the sum of all the flow weights
+            exiting that pixel. Note the target type of this raster
+            is a 64 bit float so there is minimal risk of overflow and the
+            possibility of handling a float dtype in
+            ``weight_raster_path_band``.
+        weight_raster_path_band (tuple): optional path and band number to a
+            raster that will be used as the per-pixel flow accumulation
+            weight. If ``None``, 1 is the default flow accumulation weight.
+            This raster must be the same dimensions as
+            ``flow_dir_mfd_raster_path_band``. If a weight nodata pixel is
+            encountered it will be treated as a weight value of 0.
+        raster_driver_creation_tuple (tuple): a tuple containing a GDAL driver
+            name string as the first element and a GDAL creation options
+            tuple/list as the second. Defaults to a GTiff driver tuple
+            defined at geoprocessing.DEFAULT_GTIFF_CREATION_TUPLE_OPTIONS.
+
+    Returns:
+        None.
+
+    """
+    # These variables are used to iterate over the DEM using `iterblock`
+    # indexes, a numpy.float64 type is used since we need to statically cast
+    # and it's the most complex numerical type and will be compatible without
+    # data loss for any lower type that might be used in
+    # `dem_raster_path_band[0]`.
+    cdef numpy.ndarray[numpy.int32_t, ndim=2] flow_dir_mfd_buffer_array
+    cdef int win_ysize, win_xsize, xoff, yoff
+
+    # These are used to estimate % complete
+    cdef long long visit_count, pixel_count
+
+    # the _root variables remembers the pixel index where the plateau/pit
+    # region was first detected when iterating over the DEM.
+    cdef int xi_root, yi_root
+
+    # these variables are used as pixel or neighbor indexes.
+    # _n is related to a neighbor pixel
+    cdef int i_n, xi, yi, xi_n, yi_n, i_upstream_flow
+
+    # used to hold flow direction values
+    cdef int flow_dir_mfd, upstream_flow_weight
+
+    # used as a holder variable to account for upstream flow
+    cdef int compressed_upstream_flow_dir, upstream_flow_dir_sum
+
+    # used to determine if the upstream pixel has been processed, and if not
+    # to trigger a recursive uphill walk
+    cdef double upstream_flow_accum
+
+    cdef double flow_accum_nodata = IMPROBABLE_FLOAT_NODATA
+    cdef double weight_nodata = IMPROBABLE_FLOAT_NODATA
+
+    # this value is used to store the current weight which might be 1 or
+    # come from a predefined flow accumulation weight raster
+    cdef double weight_val
+
+    # `search_stack` is used to walk upstream to calculate flow accumulation
+    # values represented in a flow pixel which stores the x/y position,
+    # next direction to check, and running flow accumulation value.
+    cdef stack[FlowPixelType] search_stack
+    cdef FlowPixelType flow_pixel
+
+    # properties of the parallel rasters
+    cdef int raster_x_size, raster_y_size
+
+    # used for time-delayed logging
+    cdef time_t last_log_time
+    last_log_time = ctime(NULL)
+
+    if not _is_raster_path_band_formatted(flow_dir_mfd_raster_path_band):
+        raise ValueError(
+            "%s is supposed to be a raster band tuple but it's not." % (
+                flow_dir_mfd_raster_path_band))
+    if weight_raster_path_band and not _is_raster_path_band_formatted(
+            weight_raster_path_band):
+        raise ValueError(
+            "%s is supposed to be a raster band tuple but it's not." % (
+                weight_raster_path_band))
+
+    LOGGER.debug('creating target flow accum raster layer')
+    ecoshard.geoprocessing.new_raster_from_base(
+        flow_dir_mfd_raster_path_band[0], target_flow_accum_raster_path,
+        gdal.GDT_Float64, [flow_accum_nodata],
+        raster_driver_creation_tuple=raster_driver_creation_tuple)
+
+    flow_accum_managed_raster = _ManagedRaster(
+        target_flow_accum_raster_path, 1, 1)
+
+    # make a temporary raster to mark where we have visisted
+    LOGGER.debug('creating visited raster layer')
+    tmp_dir_root = os.path.dirname(target_flow_accum_raster_path)
+    tmp_dir = tempfile.mkdtemp(dir=tmp_dir_root, prefix='mfd_flow_dir_')
+    visited_raster_path = os.path.join(tmp_dir, 'visited.tif')
+    ecoshard.geoprocessing.new_raster_from_base(
+        flow_dir_mfd_raster_path_band[0], visited_raster_path,
+        gdal.GDT_Byte, [0],
+        raster_driver_creation_tuple=('GTiff', (
+            'SPARSE_OK=TRUE', 'TILED=YES', 'BIGTIFF=YES', 'COMPRESS=LZW',
+            'BLOCKXSIZE=%d' % (1 << BLOCK_BITS),
+            'BLOCKYSIZE=%d' % (1 << BLOCK_BITS))))
+    visited_managed_raster = _ManagedRaster(visited_raster_path, 1, 1)
+
+    flow_dir_managed_raster = _ManagedRaster(
+        flow_dir_mfd_raster_path_band[0], flow_dir_mfd_raster_path_band[1], 0)
+    flow_dir_raster = gdal.OpenEx(
+        flow_dir_mfd_raster_path_band[0], gdal.OF_RASTER)
+    flow_dir_band = flow_dir_raster.GetRasterBand(
+        flow_dir_mfd_raster_path_band[1])
+
+    cdef _ManagedRaster weight_raster = None
+    if weight_raster_path_band:
+        weight_raster = _ManagedRaster(
+            weight_raster_path_band[0], weight_raster_path_band[1], 0)
+        raw_weight_nodata = ecoshard.geoprocessing.get_raster_info(
+            weight_raster_path_band[0])['nodata'][
+                weight_raster_path_band[1]-1]
+        if raw_weight_nodata is not None:
+            weight_nodata = raw_weight_nodata
+
+    flow_dir_raster_info = ecoshard.geoprocessing.get_raster_info(
+        flow_dir_mfd_raster_path_band[0])
+    raster_x_size, raster_y_size = flow_dir_raster_info['raster_size']
+    pixel_count = raster_x_size * raster_y_size
+    visit_count = 0
+
+    LOGGER.debug('starting search')
+    # this outer loop searches for a pixel that is locally undrained
+    for offset_dict in ecoshard.geoprocessing.iterblocks(
+            flow_dir_mfd_raster_path_band, offset_only=True,
+            largest_block=0):
+        win_xsize = offset_dict['win_xsize']
+        win_ysize = offset_dict['win_ysize']
+        xoff = offset_dict['xoff']
+        yoff = offset_dict['yoff']
+
+        if ctime(NULL) - last_log_time > _LOGGING_PERIOD:
+            last_log_time = ctime(NULL)
+            current_pixel = xoff + yoff * raster_x_size
+            LOGGER.info('%.1f%% complete', 100.0 * current_pixel / <float>(
+                raster_x_size * raster_y_size))
+
+        # make a buffer big enough to capture block and boundaries around it
+        flow_dir_mfd_buffer_array = numpy.empty(
+            (offset_dict['win_ysize']+2, offset_dict['win_xsize']+2),
+            dtype=numpy.int32)
+        flow_dir_mfd_buffer_array[:] = 0  # 0 means no flow at all
+
+        # check if we can widen the border to include real data from the
+        # raster
+        (xa, xb, ya, yb), modified_offset_dict = _generate_read_bounds(
+            offset_dict, raster_x_size, raster_y_size)
+        flow_dir_mfd_buffer_array[ya:yb, xa:xb] = flow_dir_band.ReadAsArray(
+                **modified_offset_dict).astype(numpy.int32)
+
+        # ensure these are set for the complier
+        xi_n = -1
+        yi_n = -1
+
+        # search block for to set flow accumulation
+        for yi in range(1, win_ysize+1):
+            for xi in range(1, win_xsize+1):
+                flow_dir_mfd = flow_dir_mfd_buffer_array[yi, xi]
+                if flow_dir_mfd == 0:
+                    # no flow in this pixel, so skip
+                    continue
+
+                for i_n in range(8):
+                    if ((flow_dir_mfd >> (i_n * 4)) & 0xF) == 0:
+                        # no flow in that direction
+                        continue
+                    xi_n = xi+D8_XOFFSET[i_n]
+                    yi_n = yi+D8_YOFFSET[i_n]
+
+                    if flow_dir_mfd_buffer_array[yi_n, xi_n] == 0:
+                        # if the entire value is zero, it flows nowhere
+                        # and the root pixel is draining to it, thus the
+                        # root must be a drain
+                        xi_root = xi-1+xoff
+                        yi_root = yi-1+yoff
+                        if weight_raster is not None:
+                            weight_val = <double>weight_raster.get(
+                                xi_root, yi_root)
+                            if _is_close(weight_val, weight_nodata, 1e-8, 1e-5):
+                                weight_val = 0.0
+                        else:
+                            weight_val = 1.0
+                        search_stack.push(
+                            FlowPixelType(xi_root, yi_root, 0, weight_val))
+                        visited_managed_raster.set(xi_root, yi_root, 1)
+                        visit_count += 1
+                        break
+
+                while not search_stack.empty():
+                    flow_pixel = search_stack.top()
+                    search_stack.pop()
+
+                    if ctime(NULL) - last_log_time > _LOGGING_PERIOD:
+                        last_log_time = ctime(NULL)
+                        LOGGER.info(
+                            'mfd flow accum %.1f%% complete',
+                            100.0 * visit_count / float(pixel_count))
+
+                    preempted = 0
+                    for i_n in range(flow_pixel.last_flow_dir, 8):
+                        xi_n = flow_pixel.xi+D8_XOFFSET[i_n]
+                        yi_n = flow_pixel.yi+D8_YOFFSET[i_n]
+                        if (xi_n < 0 or xi_n >= raster_x_size or
+                                yi_n < 0 or yi_n >= raster_y_size):
+                            # no upstream here
+                            continue
+                        compressed_upstream_flow_dir = (
+                            <int>flow_dir_managed_raster.get(xi_n, yi_n))
+                        upstream_flow_weight = (
+                            compressed_upstream_flow_dir >> (
+                                D8_REVERSE_DIRECTION[i_n] * 4)) & 0xF
+                        if upstream_flow_weight == 0:
+                            # no upstream flow to this pixel
+                            continue
+                        upstream_flow_accum = (
+                            flow_accum_managed_raster.get(xi_n, yi_n))
+                        if (_is_close(upstream_flow_accum, flow_accum_nodata, 1e-8, 1e-5)
+                                and not visited_managed_raster.get(
+                                    xi_n, yi_n)):
+                            # process upstream before this one
+                            flow_pixel.last_flow_dir = i_n
+                            search_stack.push(flow_pixel)
+                            if weight_raster is not None:
+                                weight_val = <double>weight_raster.get(
+                                    xi_n, yi_n)
+                                if _is_close(weight_val, weight_nodata, 1e-8, 1e-5):
+                                    weight_val = 0.0
+                            else:
+                                weight_val = 1.0
+                            search_stack.push(
+                                FlowPixelType(xi_n, yi_n, 0, weight_val))
+                            visited_managed_raster.set(xi_n, yi_n, 1)
+                            visit_count += 1
+                            preempted = 1
+                            break
+                        upstream_flow_dir_sum = 0
+                        for i_upstream_flow in range(8):
+                            upstream_flow_dir_sum += (
+                                compressed_upstream_flow_dir >> (
+                                    i_upstream_flow * 4)) & 0xF
+
+                        flow_pixel.value += (
+                            upstream_flow_accum * upstream_flow_weight /
+                            <float>upstream_flow_dir_sum)
+                    if not preempted:
+                        flow_accum_managed_raster.set(
+                            flow_pixel.xi, flow_pixel.yi,
+                            flow_pixel.value)
+    flow_accum_managed_raster.close()
+    flow_dir_managed_raster.close()
+    if weight_raster is not None:
+        weight_raster.close()
+    visited_managed_raster.close()
+    try:
+        shutil.rmtree(tmp_dir)
+    except OSError:
+        LOGGER.exception("couldn't remove temp dir")
+    LOGGER.info('%.1f%% complete', 100.0)
+
+
 def distance_to_channel_d8(
         flow_dir_d8_raster_path_band, channel_raster_path_band,
         target_distance_to_channel_raster_path,
