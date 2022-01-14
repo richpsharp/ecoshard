@@ -130,6 +130,10 @@ def main():
             "Reduce size by [factor] to with [method] to [target]. "
             "[method] must be one of 'max', 'min', 'sum', 'average', 'mode'"),
         nargs=3)
+    process_subparser.add_argument(
+        '--hash_substring_len', default=5, type=int, help=(
+            'take the first N characters of the hash to the filename when '
+            'hashing, default is 5.'))
 
     args = parser.parse_args()
 
@@ -250,7 +254,8 @@ def main():
                 ecoshard.hash_file(
                     working_file_path, target_token_path=hash_token_path,
                     rename=args.rename, hash_algorithm=args.hashalg,
-                    force=args.force)
+                    force=args.force,
+                    hash_substring_len=args.hash_substring_len)
     return return_code
 
 

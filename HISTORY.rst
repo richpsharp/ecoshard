@@ -3,9 +3,6 @@ Release History
 
 Unreleased Changes
 ------------------
-* Added functionality to publish a local file directly to an EcoShard server.
-  This is available in the command line publish command whose arguments have
-  been redefined from the previous version.
 * Added flag to allow for multi-thread version of TaskGraph.
 * Fixed issue with geoprocessing bounding box projection on exotic projections
   such as sinusoidal to wgs84.
@@ -14,6 +11,8 @@ Unreleased Changes
 * Fixed an issue that would cause a crash in stitching rasters where the base
   raster was too far up/left of the target stitch raster but still overlapped
   with the stitch target.
+* Added feature to limit hash length to a given size, helps with long
+  filenames.
 
 0.4.0 (2019/04/13)
 ------------------

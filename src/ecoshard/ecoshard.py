@@ -23,7 +23,7 @@ LOGGER = logging.getLogger(__name__)
 
 def hash_file(
         base_path, target_token_path=None, target_dir=None, rename=False,
-        hash_algorithm='md5', force=False):
+        hash_algorithm='md5', force=False, hash_substring_len=5):
     """Ecoshard file by hashing it and appending hash to filename.
 
     An EcoShard is the hashing of a file and the rename to the following
@@ -45,6 +45,8 @@ def hash_file(
         force (bool): if True and the base_path already is in ecoshard format
             the operation proceeds including the possibility that the
             base_path ecoshard file name is renamed to a new hash.
+        hash_substring_len (int): limit the hexcode hash to be this many
+            characters long. Defaults to 5.
 
     Returns:
         None.
@@ -83,6 +85,7 @@ def hash_file(
 
     LOGGER.debug('calculating hash for %s', base_path)
     hash_val = calculate_hash(base_path, hash_algorithm)
+    hash_val = hash_val[:hash_substring_len]
 
     if target_dir is None:
         target_dir = os.path.dirname(base_path)
@@ -190,6 +193,8 @@ def validate(base_ecoshard_path):
     hash_algorithm, hash_value = match_result.groups()
     calculated_hash = calculate_hash(
         base_ecoshard_path, hash_algorithm)
+    # we allow shorter hashes, this ensures same length
+    calculated_hash = calculated_hash[:len(hash_value)]
     if calculated_hash != match_result.group(2):
         raise ValueError(
             'hash does not match, calculated %s and expected %s '
